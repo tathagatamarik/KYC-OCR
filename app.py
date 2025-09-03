@@ -1,59 +1,124 @@
-from flask import Flask, request, jsonify
-from flask_restful import Api, Resource
-from flask_swagger_ui import get_swaggerui_blueprint
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
+from fastapi.responses import JSONResponse
 import os
-from image_processing import encode_image, get_image_analysis, process_response  # Import the image processing functions
+import uuid
+from image_processing import encode_image, get_image_analysis, process_response
+from celery_app import celery_app
+from auth import get_api_key
+from blur_check import image_preops
+import json
+from openai import OpenAI
+import base64
 
-app = Flask(__name__)
-api = Api(app)
+# Constants
+UPLOAD_DIR = 'uploads'
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Swagger UI setup
-SWAGGER_URL = '/swagger'
-API_URL = '/static/swagger.json'  # Path to Swagger JSON file
-
-swagger_ui_blueprint = get_swaggerui_blueprint(
-    SWAGGER_URL,
-    API_URL,
-    config={
-        'app_name': "GPT-4 Vision Image Processing"
-    }
+# Initialize FastAPI app
+app = FastAPI(
+    title="GPT-4 Vision Image Processing",
+    description="API for processing images using GPT-4 Vision model",
+    version="1.0.0"
 )
-app.register_blueprint(swagger_ui_blueprint, url_prefix=SWAGGER_URL)
 
-class ImageProcessor(Resource):
-    def post(self):
-        """
-        API endpoint that receives an image, processes it, and returns the relevant fields.
-        """
-        if 'image' not in request.files:
-            return jsonify({"error": "No image file provided"}), 400
-        
-        image_file = request.files['image']
-        
-        # Save the image temporarily
-        temp_path = 'temp_image.jpg'
-        image_file.save(temp_path)
-        
+@celery_app.task(name='image_processing.process_image_task', 
+                bind=True,
+                max_retries=3,
+                default_retry_delay=60)
+def process_image_task(self, image_path: str):
+    """
+    Celery task to process an image using GPT-4 Vision model.
+    """
+    try:
+        # Run pre-processing
+        preops_result, preops_error = image_preops(image_path)
+        if preops_result is None:
+            # Store error for retrieval with 422 code
+            return {"error": preops_error, "status_code": 422}
+
+        # Encode the processed image (JPEG bytes) to base64
+        encoded_image = encode_image(preops_result)
+        openai_response = get_image_analysis(encoded_image)
+        result = process_response(openai_response)
+        return result
+    except Exception as e:
         try:
-            # Encode the uploaded image to base64
-            encoded_image = encode_image(temp_path)
+            self.retry(exc=e)
+        except self.MaxRetriesExceededError:
+            return {"error": f"Image processing failed after 3 retries: {str(e)}", "status_code": 500}
+    finally:
+        try:
+            os.remove(image_path)
+        except FileNotFoundError:
+            pass
 
-            # Perform image analysis with the base64-encoded image
-            openai_response = get_image_analysis(encoded_image)
+@app.post("/read_text")
+async def process_image(
+    image: UploadFile = File(...),
+    api_key: str = Depends(get_api_key)
+):
+    """
+    Queue an image for processing using GPT-4 Vision model.
+    Returns a task ID for tracking the processing status.
+    """
+    try:
+        # Save the uploaded image to disk
+        task_id = str(uuid.uuid4())
+        image_path = os.path.join(UPLOAD_DIR, f"{task_id}_{image.filename}")
+        with open(image_path, "wb") as f:
+            f.write(await image.read())
+        # Queue the task
+        task = process_image_task.apply_async(args=[image_path], task_id=task_id)
+        return JSONResponse(
+            status_code=202,
+            content={"id": task_id}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to queue image: {str(e)}")
 
-            # Process the OpenAI response and get the result
-            result = process_response(openai_response)
-
-            os.remove(temp_path)  # Clean up the temporary file
-            
-            # Return the analysis as JSON
-            return jsonify(result)
-
-        except Exception as e:
-            os.remove(temp_path)
-            return jsonify({"error": str(e)}), 500
-
-api.add_resource(ImageProcessor, '/process_image')
+@app.get("/id")
+async def get_task_status(
+    task_id: str,
+    api_key: str = Depends(get_api_key)
+):
+    """
+    Get the status and result of a processing task.
+    """
+    try:
+        task = celery_app.AsyncResult(task_id)
+        # Check task state
+        if task.state == 'PENDING':
+            return JSONResponse(
+                status_code=202,
+                content={"status": "Processing"}
+            )
+        elif task.state == 'SUCCESS':
+            result = task.result
+            if isinstance(result, dict) and result.get("status_code") == 422:
+                return JSONResponse(
+                    status_code=422,
+                    content={"error": result.get("error")}
+                )
+            return JSONResponse(
+                status_code=200,
+                content=result
+            )
+        elif task.state == 'FAILURE':
+            return JSONResponse(
+                status_code=500,
+                content={"error": str(task.result)}
+            )
+        else:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Task ID not found"}
+            )
+    except Exception as e:
+        return JSONResponse(
+            status_code=400,
+            content={"error": str(e)}
+        )
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
